@@ -1,0 +1,153 @@
+name: Deploy AWS News to Slack Bot
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - prod
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest flake8
+    
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Test with pytest
+      run: |
+        # 테스트 파일이 있다면 실행
+        if [ -f "test_lambda_function.py" ]; then
+          pytest test_lambda_function.py -v
+        else
+          echo "No test files found, skipping tests"
+        fi
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+    
+    - name: Set environment variables
+      run: |
+        if [ "${{ github.event.inputs.environment }}" == "prod" ] || [ "${{ github.ref }}" == "refs/heads/main" ]; then
+          echo "FUNCTION_NAME=aws-news-to-slack-prod" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION_PROD || 'ap-northeast-2' }}" >> $GITHUB_ENV
+          echo "SLACK_WEBHOOK=${{ secrets.SLACK_WEBHOOK_PROD }}" >> $GITHUB_ENV
+          echo "DYNAMODB_TABLE=${{ secrets.DYNAMODB_TABLE_PROD || 'ProcessedNews-prod' }}" >> $GITHUB_ENV
+          echo "BEDROCK_MODEL_ID=${{ secrets.BEDROCK_MODEL_ID_PROD || 'anthropic.claude-3-haiku-20240307-v1:0' }}" >> $GITHUB_ENV
+        else
+          echo "FUNCTION_NAME=aws-news-to-slack-dev" >> $GITHUB_ENV
+          echo "AWS_REGION=${{ secrets.AWS_REGION_DEV || 'ap-northeast-2' }}" >> $GITHUB_ENV
+          echo "SLACK_WEBHOOK=${{ secrets.SLACK_WEBHOOK_DEV }}" >> $GITHUB_ENV
+          echo "DYNAMODB_TABLE=${{ secrets.DYNAMODB_TABLE_DEV || 'ProcessedNews-dev' }}" >> $GITHUB_ENV
+          echo "BEDROCK_MODEL_ID=${{ secrets.BEDROCK_MODEL_ID_DEV || 'anthropic.claude-3-haiku-20240307-v1:0' }}" >> $GITHUB_ENV
+        fi
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt -t .
+    
+    - name: Create deployment package
+      run: |
+        zip -r ${{ env.FUNCTION_NAME }}.zip . -x "*.git*" "*.md" "*.drawio" "*.sh" "__pycache__/*" "*.pyc" ".github/*"
+    
+    - name: Deploy to AWS Lambda
+      run: |
+        # Check if function exists
+        if aws lambda get-function --function-name ${{ env.FUNCTION_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "Updating existing function..."
+          aws lambda update-function-code \
+            --function-name ${{ env.FUNCTION_NAME }} \
+            --zip-file fileb://${{ env.FUNCTION_NAME }}.zip \
+            --region ${{ env.AWS_REGION }}
+        else
+          echo "Function does not exist. Please create it manually first or use CloudFormation."
+          exit 1
+        fi
+    
+    - name: Update function configuration
+      run: |
+        aws lambda update-function-configuration \
+          --function-name ${{ env.FUNCTION_NAME }} \
+          --environment Variables="{SLACK_WEBHOOK=${{ env.SLACK_WEBHOOK }},AWS_REGION=${{ env.AWS_REGION }},DYNAMODB_TABLE=${{ env.DYNAMODB_TABLE }},BEDROCK_MODEL_ID=${{ env.BEDROCK_MODEL_ID }}}" \
+          --region ${{ env.AWS_REGION }}
+    
+    - name: Test deployment
+      run: |
+        echo "Testing Lambda function..."
+        aws lambda invoke \
+          --function-name ${{ env.FUNCTION_NAME }} \
+          --region ${{ env.AWS_REGION }} \
+          --payload '{}' \
+          response.json
+        
+        cat response.json
+        
+        # Check if the response contains an error
+        if grep -q "errorMessage" response.json; then
+          echo "Lambda function test failed!"
+          exit 1
+        else
+          echo "Lambda function test passed!"
+        fi
+
+  notify:
+    needs: [test, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notify deployment status
+      if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+      run: |
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "✅ Deployment successful!"
+        else
+          echo "❌ Deployment failed!"
+        fi
